@@ -21,6 +21,7 @@ import asyncio
 import os
 import random
 from asyncio import Task
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from playwright.async_api import (
@@ -184,6 +185,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
     async def get_creators_and_notes(self) -> None:
         """Get creator's notes and retrieve their comment information."""
         utils.logger.info("[XiaoHongShuCrawler.get_creators_and_notes] Begin get Xiaohongshu creators")
+        _progress_file = Path(".batch_progress_creator")
         for creator_url in config.XHS_CREATOR_ID_LIST:
             try:
                 # Parse creator URL to get user_id and security tokens
@@ -220,6 +222,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 note_ids.append(note_item.get("note_id"))
                 xsec_tokens.append(note_item.get("xsec_token"))
             await self.batch_get_note_comments(note_ids, xsec_tokens)
+
+            # 记录已完成的 creator，供断点续传（追加写入，不重复）
+            with open(_progress_file, "a", encoding="utf-8") as _f:
+                _f.write(user_id + "\n")
+            utils.logger.info(f"[XiaoHongShuCrawler.get_creators_and_notes] Marked done: {user_id}")
 
     async def fetch_creator_notes_detail(self, note_list: List[Dict]):
         """Concurrently obtain the specified post list and save the data"""
@@ -302,12 +309,6 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
                 note_detail.update({"xsec_token": xsec_token, "xsec_source": xsec_source})
 
-                # Sleep after fetching note detail
-                await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                utils.logger.info(f"[get_note_detail_async_task] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching note {note_id}")
-
-                return note_detail
-
             except NoteNotFoundError as ex:
                 utils.logger.warning(f"[XiaoHongShuCrawler.get_note_detail_async_task] Note not found: {note_id}, {ex}")
                 return None
@@ -317,6 +318,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
             except KeyError as ex:
                 utils.logger.error(f"[XiaoHongShuCrawler.get_note_detail_async_task] have not fund note detail note_id:{note_id}, err: {ex}")
                 return None
+
+        # Sleep 在 semaphore 外部：释放锁后再等待，允许其他任务并发执行 API 请求
+        await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+        utils.logger.info(f"[get_note_detail_async_task] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching note {note_id}")
+        return note_detail
 
     async def batch_get_note_comments(self, note_list: List[str], xsec_tokens: List[str]):
         """Batch get note comments"""
