@@ -30,8 +30,44 @@ XHS_SPECIFIED_NOTE_URL_LIST = [
 ]
 
 # Specify the creator URL list, which needs to carry xsec_token and xsec_source parameters.
+# 支持完整 URL（含 xsec_token）或纯 user_id（24 位 hex）两种格式。
+# 默认从项目根目录的 user_id.json 读取，排除 .batch_progress_creator 中已处理的 id。
 
-XHS_CREATOR_ID_LIST = [
-    "https://www.xiaohongshu.com/user/profile/5f58bd990000000001003753?xsec_token=ABYVg1evluJZZzpMX-VWzchxQ1qSNVW3r-jOEnKqMcgZw=&xsec_source=pc_search"
-    # ........................
-]
+import json as _json
+import os as _os
+
+
+def _load_pending_creator_ids() -> list[str]:
+    """从 user_id.json 加载待处理 user_id，自动排除 .batch_progress_creator 中已完成的。
+
+    支持通过环境变量切片，用于多机并行：
+      XHS_CREATOR_START  起始索引（1-based，含），默认 1
+      XHS_CREATOR_END    结束索引（1-based，含），默认最后一条
+    """
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    user_id_file = _os.path.join(root, "user_id.json")
+    progress_file = _os.path.join(root, ".batch_progress_creator")
+
+    if not _os.path.exists(user_id_file):
+        # user_id.json 不存在时回退到空列表（可在此处手动填写 URL）
+        return []
+
+    with open(user_id_file, encoding="utf-8") as f:
+        all_ids: list[str] = _json.load(f)
+
+    # 读取切片范围（1-based）
+    start_idx = int(_os.environ.get("XHS_CREATOR_START", "1"))
+    end_idx = int(_os.environ.get("XHS_CREATOR_END", str(len(all_ids))))
+    # 转为 0-based slice
+    all_ids = all_ids[start_idx - 1 : end_idx]
+
+    done_ids: set[str] = set()
+    if _os.path.exists(progress_file):
+        with open(progress_file, encoding="utf-8") as f:
+            done_ids = {line.strip() for line in f if line.strip()}
+
+    pending = [uid for uid in all_ids if uid not in done_ids]
+    return pending
+
+
+XHS_CREATOR_ID_LIST = _load_pending_creator_ids()
