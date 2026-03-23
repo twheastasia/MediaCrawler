@@ -102,7 +102,7 @@ START_PAGE = 1
 CRAWLER_MAX_NOTES_COUNT = 100
 
 # Controlling the number of concurrent crawlers
-MAX_CONCURRENCY_NUM = 3
+MAX_CONCURRENCY_NUM = 2
 
 # 是否启用媒体下载（封面、视频，以及图文帖的图片），默认关闭。
 # 开启后媒体文件按 {SAVE_DATA_PATH 或 data}/{platform}/media/{内容ID}/ 目录聚合存放。
