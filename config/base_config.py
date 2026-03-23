@@ -86,7 +86,7 @@ START_PAGE = 1
 CRAWLER_MAX_NOTES_COUNT = 100
 
 # Controlling the number of concurrent crawlers
-MAX_CONCURRENCY_NUM = 3
+MAX_CONCURRENCY_NUM = 2
 
 # Whether to enable crawling media mode (including image or video resources), crawling media is not enabled by default
 ENABLE_GET_MEIDAS = False
