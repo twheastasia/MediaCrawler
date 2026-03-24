@@ -308,6 +308,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         raise Exception(f"[get_note_detail_async_task] Failed to get note detail, Id: {note_id}")
 
                 note_detail.update({"xsec_token": xsec_token, "xsec_source": xsec_source})
+                # Sleep after fetching note detail
+                await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+                utils.logger.info(f"[get_note_detail_async_task] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching note {note_id}")
+                return note_detail
 
             except NoteNotFoundError as ex:
                 utils.logger.warning(f"[XiaoHongShuCrawler.get_note_detail_async_task] Note not found: {note_id}, {ex}")
@@ -319,10 +323,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 utils.logger.error(f"[XiaoHongShuCrawler.get_note_detail_async_task] have not fund note detail note_id:{note_id}, err: {ex}")
                 return None
 
-        # Sleep 在 semaphore 外部：释放锁后再等待，允许其他任务并发执行 API 请求
-        await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-        utils.logger.info(f"[get_note_detail_async_task] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching note {note_id}")
-        return note_detail
+        # # Sleep 在 semaphore 外部：释放锁后再等待，允许其他任务并发执行 API 请求
+        # await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+        # utils.logger.info(f"[get_note_detail_async_task] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching note {note_id}")
+        # return note_detail
 
     async def batch_get_note_comments(self, note_list: List[str], xsec_tokens: List[str]):
         """Batch get note comments"""
