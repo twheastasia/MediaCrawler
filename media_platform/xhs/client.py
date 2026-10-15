@@ -150,6 +150,19 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         async with make_async_client(proxy=self.proxy) as client:
             response = await client.request(method, url, timeout=self.timeout, **kwargs)
 
+        # Debug: log status code, response headers, and request sign headers for diagnosing issues
+        if not response.is_success or response.status_code in (406, 403, 461, 471):
+            req_headers = kwargs.get("headers", {})
+            utils.logger.warning(
+                f"[XiaoHongShuClient.request] {method} {url}\n"
+                f"  -> HTTP {response.status_code}\n"
+                f"  -> resp headers: {dict(response.headers)}\n"
+                f"  -> resp body: {response.text[:500]}\n"
+                f"  -> req X-S: {req_headers.get('X-S', 'N/A')[:50]}...\n"
+                f"  -> req X-T: {req_headers.get('X-T', 'N/A')}\n"
+                f"  -> req x-S-Common: {req_headers.get('x-S-Common', 'N/A')[:50]}..."
+            )
+
         if response.status_code in {401, 403, 429}:
             raise PlatformAccessError(
                 f"XHS request blocked with HTTP {response.status_code}"

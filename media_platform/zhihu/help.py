@@ -30,7 +30,7 @@ from constant import zhihu as zhihu_constant
 from model.m_zhihu import ZhihuComment, ZhihuContent, ZhihuCreator
 from tools import utils
 from tools.crawler_util import extract_text_from_html
-from tools.user_hash import anonymize_user_id, mask_nickname
+from tools.user_hash import anonymize_user_id
 
 ZHIHU_SGIN_JS = None
 
@@ -200,7 +200,7 @@ class ZhihuExtractor:
             if not author.get("id"):
                 author = author.get("member")
             res.creator_hash = anonymize_user_id(author.get("id"))
-            res.user_nickname = mask_nickname(author.get("name"))
+            res.user_nickname = author.get("name") or ""
 
         except Exception as e :
             utils.logger.warning(
@@ -339,7 +339,7 @@ class ZhihuExtractor:
 
         res = ZhihuCreator()
         res.creator_hash = anonymize_user_id(creator_info.get("id"))
-        res.user_nickname = mask_nickname(creator_info.get("name"))
+        res.user_nickname = creator_info.get("name") or ""
         res.follows = creator_info.get("followingCount")
         res.fans = creator_info.get("followerCount")
         res.anwser_count = creator_info.get("answerCount")

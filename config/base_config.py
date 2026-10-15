@@ -17,6 +17,8 @@
 # 详细许可条款请参阅项目根目录下的LICENSE文件。
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
+import os
+
 # Basic configuration
 PLATFORM = "xhs"  # Platform, xhs | dy | ks | bili | wb | tieba | zhihu
 
@@ -87,7 +89,7 @@ CDP_CONNECT_EXISTING = True
 AUTO_CLOSE_BROWSER = True
 
 # Data saving type option configuration, supports: csv, db, json, jsonl, sqlite, excel, postgres. It is best to save to DB, with deduplication function.
-SAVE_DATA_OPTION = "sqlite"  # csv or db or json or jsonl or sqlite or excel or postgres
+SAVE_DATA_OPTION = os.getenv("SAVE_DATA_OPTION", "sqlite")  # csv or db or json or jsonl or sqlite or excel or postgres
 
 # Data saving path, if not specified by default, it will be saved to the data folder.
 SAVE_DATA_PATH = ""
@@ -102,7 +104,7 @@ START_PAGE = 1
 CRAWLER_MAX_NOTES_COUNT = 100
 
 # Controlling the number of concurrent crawlers
-MAX_CONCURRENCY_NUM = 2
+MAX_CONCURRENCY_NUM = 1
 
 # 是否启用媒体下载（封面、视频，以及图文帖的图片），默认关闭。
 # 开启后媒体文件按 {SAVE_DATA_PATH 或 data}/{platform}/media/{内容ID}/ 目录聚合存放。
@@ -137,7 +139,7 @@ STOP_WORDS_FILE = "./docs/hit_stopwords.txt"
 FONT_PATH = "./docs/STZHONGS.TTF"
 
 # Crawl interval
-CRAWLER_MAX_SLEEP_SEC = 2
+CRAWLER_MAX_SLEEP_SEC = 10
 
 # 是否禁用 SSL 证书验证。仅在使用企业代理、Burp Suite、mitmproxy 等会注入自签名证书的中间人代理时设为 True。
 # 警告：禁用 SSL 验证将使所有流量暴露于中间人攻击风险，请勿在生产环境中开启。

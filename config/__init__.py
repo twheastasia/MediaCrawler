@@ -18,5 +18,12 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 
+from pathlib import Path as _Path
+
+from dotenv import load_dotenv as _load_dotenv
+
+# Load project settings before importing configs; process environment takes priority.
+_load_dotenv(_Path(__file__).resolve().parents[1] / ".env", override=False)
+
 from .base_config import *
 from .db_config import *

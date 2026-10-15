@@ -185,3 +185,7 @@ debug_tools
 database/*.db
 .omx/
 .batch_progress*
+.planning/
+collection/README.md
+AGENTS.md
+.batch_progress_creator

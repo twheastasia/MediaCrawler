@@ -66,7 +66,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self.index_url = "https://www.rednote.com" if config.XHS_INTERNATIONAL else "https://www.xiaohongshu.com"
         self.cookie_urls = [self.index_url]
         # self.user_agent = utils.get_user_agent()
-        self.user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        self.user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
         self.cdp_manager = None
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
         self._media_downloader: Optional[MediaDownloader] = None
@@ -211,6 +211,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     xsec_token=creator_info.xsec_token,
                     xsec_source=creator_info.xsec_source
                 )
+                utils.logger.info(f"[XiaoHongShuCrawler.get_creators_and_notes] Creator info: {createor_info}")
                 if createor_info:
                     await xhs_store.save_creator(user_id, creator=createor_info)
             except ValueError as e:
@@ -224,9 +225,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 )
                 continue
 
-            # Use fixed crawling interval
-            crawl_interval = config.CRAWLER_MAX_SLEEP_SEC
-            # Get all note information of the creator
+            crawl_interval = random.uniform(3, 8)
+            utils.logger.info(f"[XiaoHongShuCrawler.get_creators_and_notes] Sleeping for {crawl_interval:.2f} seconds before crawling notes for creator {user_id}")
+            await asyncio.sleep(crawl_interval)
+
+            # Get all note information of the creator (diagnostic: test the user_posted API)
             all_notes_list = await self.xhs_client.get_all_notes_by_creator(
                 user_id=user_id,
                 crawl_interval=crawl_interval,

@@ -102,7 +102,7 @@ async def update_douyin_aweme(aweme_item: Dict):
         "desc": aweme_item.get("desc", ""),
         "create_time": aweme_item.get("create_time"),
         "creator_hash": anonymize_user_id(user_info.get("uid")),  # 创作者匿名哈希(不存原始 uid)
-        "nickname": mask_nickname(user_info.get("nickname")),  # 用户昵称(已脱敏)
+        "nickname": user_info.get("nickname") or "",  # 平台公开昵称，原样保存
         "liked_count": str(interact_info.get("digg_count")),
         "collected_count": str(interact_info.get("collect_count")),
         "comment_count": str(interact_info.get("comment_count")),

@@ -63,7 +63,7 @@ async def update_bilibili_video(video_item: Dict):
         "desc": video_item_view.get("desc", "")[:500],
         "create_time": video_item_view.get("pubdate"),
         "creator_hash": anonymize_user_id(video_user_info.get("mid")),  # 创作者匿名哈希(不存原始 mid)
-        "nickname": mask_nickname(video_user_info.get("name")),  # 用户昵称(已脱敏)
+        "nickname": video_user_info.get("name") or "",  # 平台公开昵称，原样保存
         "liked_count": str(video_item_stat.get("like", "")),
         "disliked_count": str(video_item_stat.get("dislike", "")),
         "video_play_count": str(video_item_stat.get("view", "")),
