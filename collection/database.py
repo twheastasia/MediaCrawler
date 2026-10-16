@@ -40,6 +40,12 @@ def encoded(value):
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
+from collection.comment_store import comment_ddl
+DDL += comment_ddl('acquisition')
+from collection.native_comments import schema_ddl
+DDL += schema_ddl()
+
+
 class Store:
     def __init__(self, pool, run_id, platform):
         self.pool, self.run_id, self.platform = pool, run_id, platform

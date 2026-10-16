@@ -48,3 +48,6 @@ CREATE TABLE IF NOT EXISTS wxarticle_media_detail (
 CREATE INDEX IF NOT EXISTS wxarticle_task_status_idx ON wxarticle_task(run_id,kind,status);
 CREATE INDEX IF NOT EXISTS wxarticle_source_candidate_idx ON wxarticle_source(run_id,candidate_key);
 """
+
+from collection.comment_store import comment_ddl
+DDL += comment_ddl('wxarticle')

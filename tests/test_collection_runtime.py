@@ -106,7 +106,7 @@ def test_xhs_candidates_preserve_author_and_detail_token():
 def test_monitor_keeps_live_and_finished_jobs_and_never_retries_access_barriers(tmp_path,monkeypatch):
     import collection.supervisor as supervisor
     from types import SimpleNamespace
-    monkeypatch.setattr(supervisor,'PAGES',{'bili':None,'dy':None,'zhihu':None,'xhs':None})
+    monkeypatch.setattr(supervisor,'ORIGINAL_PLATFORMS',('bili','dy','zhihu','xhs'))
     monkeypatch.setattr(supervisor,'alive',lambda pid,platform:platform=='dy')
     (tmp_path/'processes.json').write_text(json.dumps({'processes':[{'platform':'dy','pid':1}]}))
     for p,status in {'bili':{'status':'blocked','error_type':'AccessRestricted'},

@@ -110,10 +110,14 @@ class TieBaDbStoreImplement(AbstractStore):
             res = await session.execute(stmt)
             db_note = res.scalar_one_or_none()
             if db_note:
+                # Keep the first acquisition time when a post is refreshed.
+                if not db_note.add_ts:
+                    db_note.add_ts = utils.get_current_timestamp()
                 for key, value in content_item.items():
-                    setattr(db_note, key, value)
+                    if key != "add_ts":
+                        setattr(db_note, key, value)
             else:
-                db_note = TiebaNote(**content_item)
+                db_note = TiebaNote(**{**content_item, "add_ts": utils.get_current_timestamp()})
                 session.add(db_note)
             await session.commit()
 

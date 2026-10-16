@@ -10,3 +10,10 @@ HISTORY_PER_AUTHOR = 10
 SEARCH_PAGE_BUDGET = 100
 PAGES = {'bili':'p1','dy':'p2','zhihu':'p3','xhs':'p4'}
 DOMAINS = {'bili':'https://www.bilibili.com','dy':'https://www.douyin.com','zhihu':'https://www.zhihu.com','xhs':'https://www.xiaohongshu.com'}
+ADDITIONAL_PLATFORMS = ('ks', 'wb', 'tieba')
+ORIGINAL_PLATFORMS = ('bili', 'dy', 'zhihu', 'xhs')
+PAGES.update(dict(ks='p5', wb='p6', tieba='p7'))
+DOMAINS.update(dict(ks='https://www.kuaishou.com', wb='https://m.weibo.cn', tieba='https://tieba.baidu.com'))
+OPENCLI_PLATFORMS = ('maimai', 'linkedin')
+PAGES.update(dict(maimai='p8', linkedin='p9'))
+DOMAINS.update(dict(maimai='https://maimai.cn', linkedin='https://www.linkedin.com'))

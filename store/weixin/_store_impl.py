@@ -141,6 +141,13 @@ class WeixinStore(WxArticleRecords):
 
     async def _merge(self, c, old_id, new_id):
         """Resolve short/long URL identities in the same transaction as the article."""
+        await c.execute("""INSERT INTO wxarticle_comment
+            (platform,content_type,content_id,comment_id,parent_comment_id,author_id,author_name,
+             body,published_at,like_count,raw,collected_at,updated_at)
+            SELECT platform,content_type,$2,comment_id,parent_comment_id,author_id,author_name,
+             body,published_at,like_count,raw,collected_at,updated_at FROM wxarticle_comment
+            WHERE platform='weixin' AND content_type='article' AND content_id=$1 ON CONFLICT DO NOTHING""",old_id,new_id)
+        await c.execute("DELETE FROM wxarticle_comment WHERE platform='weixin' AND content_type='article' AND content_id=$1",old_id)
         await c.execute("""INSERT INTO wxarticle_link(run_id,platform,keyword,role,content_type,content_id)
             SELECT run_id,platform,keyword,role,content_type,$2 FROM wxarticle_link
             WHERE platform='weixin' AND content_type='article' AND content_id=$1 ON CONFLICT DO NOTHING""", old_id, new_id)

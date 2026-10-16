@@ -2,7 +2,7 @@
 import argparse,fcntl,json,os,subprocess,sys,time
 from pathlib import Path
 from collection.launch import ROOT,DEFAULT_OUTPUT
-from collection.settings import PAGES
+from collection.settings import ORIGINAL_PLATFORMS
 
 BARRIERS={'AccessRestricted','LoginRequired','PlatformAccessError','IPBlockError','RetryError'}
 def alive(pid,platform=None):
@@ -24,7 +24,7 @@ def inspect(output):
     report={'pid':os.getpid(),'checked_at':now,'platforms':{},'enabled':True}
     if read(output/'monitor_control.json',{}).get('enabled') is False:
         report['enabled']=False;save(output/'monitor_status.json',report);return report
-    for platform in PAGES:
+    for platform in manifest.get('platforms',ORIGINAL_PLATFORMS):
         status=read(output/platform/'status.json',{})
         record=records.get(platform,{})
         info={'worker_status':status.get('status','not_started'),'alive':alive(record.get('pid'),platform)}
@@ -42,6 +42,7 @@ def inspect(output):
         history[platform]=attempts+[now]
         try:
             result=subprocess.run([sys.executable,'-m','collection.launch','--output',str(output),
+                '--run-id',manifest.get('run_id','mit_ai_smallbatch_20261014'),
                 '--allow-session-memory','--resume','--platform',platform],cwd=ROOT,capture_output=True,text=True,timeout=45)
             info['action']='restarted' if result.returncode==0 else 'restart_failed'
             info['exit_code']=result.returncode

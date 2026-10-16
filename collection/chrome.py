@@ -21,7 +21,11 @@ class ChromePage:
         if not self.browser.contexts:raise RuntimeError('existing Chrome context missing')
         self.context=self.browser.contexts[0]
         self.page=await self.context.new_page()
-        await self.gate.action('chrome_initial_page',lambda:self.page.goto(origin,wait_until='domcontentloaded',timeout=30000))
+        if getattr(self,'response_observer',None):
+            self.page.on('response',self.response_observer)
+        # new_page() is already about:blank: no network request or extra pacing slot.
+        if origin != 'about:blank':
+            await self.gate.action('chrome_initial_page',lambda:self.page.goto(origin,wait_until='domcontentloaded',timeout=30000))
     async def evaluate(self,expression,argument=None):
         if expression=='() => window.localStorage':
             expression="() => Object.fromEntries(['wbi_img_urls','wbi_img_url','wbi_sub_url','xmst','HasUserLogin'].map(k=>[k,localStorage.getItem(k)]))"

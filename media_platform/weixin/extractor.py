@@ -7,7 +7,6 @@ This implementation preserves article HTML before deriving text/Markdown.
 from __future__ import annotations
 
 import hashlib
-import html
 import re
 from datetime import datetime
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -16,10 +15,10 @@ from zoneinfo import ZoneInfo
 from lxml import html as lh
 
 from collection.runtime import AccessRestricted
-from .exception import ArticleUnavailable, ParseError
+from .exception import ArticleUnavailable, ArticleSkipped, ParseError
 from model.m_weixin import WeixinArticleRaw, WeixinContent, WeixinSearchResult
 
-PARSER_VERSION = "weixin-1"
+PARSER_VERSION = "weixin-2"
 SENSITIVE = re.compile(r"cookie|session|password|passwd|authorization|(?:^|_)token$|^key$|pass_ticket|uin|ticket|credential", re.I)
 
 
@@ -29,7 +28,9 @@ def digest(value):
 
 def public_url(value, base="https://mp.weixin.qq.com/"):
     """Only public HTTP(S) references; remove known session-bearing query keys."""
-    value = html.unescape((value or "").strip())
+    # DOM URLs are already decoded. HTML's semicolon-less entities would turn
+    # &timestamp into ×tamp (and corrupt other ordinary query parameter names).
+    value = (value or "").strip().replace("&amp;", "&")
     parsed = urlsplit(urljoin(base, value))
     if parsed.scheme not in ("https", "http") or not parsed.hostname or parsed.username or parsed.password:
         return ""
@@ -38,7 +39,7 @@ def public_url(value, base="https://mp.weixin.qq.com/"):
 
 
 def article_url(value):
-    value = html.unescape(value.strip().strip('"\'“”‘’<>「」'))
+    value = value.strip().strip('"\'“”‘’<>「」').replace("&amp;", "&")
     value = re.sub(r"\\+([:/&?=#%])", r"\1", value)
     if value.startswith("mp.weixin.qq.com/"):
         value = "https://" + value
@@ -60,6 +61,18 @@ def candidate_url(value):
     if p.hostname == "weixin.sogou.com" and p.path == "/link" and p.port in (None, 443):
         return safe
     raise ValueError("unsupported_discovery_url")
+
+
+def discovery_navigation_url(value):
+    """Transient Sogou routing token: use in memory, never persist this URL."""
+    canonical = candidate_url(value)
+    if urlsplit(canonical).hostname != "weixin.sogou.com":
+        return canonical
+    raw = urlsplit(urljoin("https://weixin.sogou.com/", value.replace("&amp;", "&")))
+    # Only the public bridge's routing parameters may accompany its token.
+    pairs = [(k, v) for k, v in parse_qsl(raw.query, keep_blank_values=True)
+             if k in {"url", "type", "query", "token"}]
+    return urlunsplit(("https", "weixin.sogou.com", "/link", urlencode(pairs), ""))
 
 
 def search_url(keyword, page):
@@ -165,7 +178,7 @@ def article_identity(url, metadata):
 
 
 def parse_article(snapshot):
-    access_check(snapshot.get("page_text", ""), snapshot.get("url", ""), snapshot.get("verify", False))
+    check_article_page(snapshot)
     try:
         url = article_url(snapshot.get("canonical") or snapshot["url"])
     except ValueError:
@@ -204,6 +217,15 @@ def parse_article(snapshot):
         id=content_id, author_id=author_id, title=title, body=root.text_content(),
         url=url, time=stamp, raw=raw.model_dump(),
     ).model_dump()
+
+
+def check_article_page(snapshot):
+    """Preserve real barriers; skip account/content failures without following links."""
+    access_check(snapshot.get("page_text", ""), snapshot.get("url", ""), snapshot.get("verify", False))
+    if "该公众号已迁移" in snapshot.get("page_text", ""):
+        raise ArticleSkipped("account_migrated")
+    if re.search(r"(?:此|该)?(?:公众)?账号已被(?:屏蔽|封禁)|(?:此|该)账号已注销", snapshot.get("page_text", "")):
+        raise ArticleSkipped("account_blocked")
 
 
 def parse_search(snapshot):
@@ -249,6 +271,7 @@ ARTICLE_SNAPSHOT = r"""() => {
   })).filter(x=>x.url) : [];
   return {url:location.href, canonical:document.querySelector('meta[property="og:url"]')?.content||'',
     page_text:content?'':(document.body?.innerText||''),
+    migration_url:document.querySelector('a#js_access_msg')?.getAttribute('href')||'',
     verify:!!document.querySelector('#js_verify')||location.href.includes('secitptpage/verify'),
     title:text('#activity-name','#js_text_title','.rich_media_title'),
     account_name:text('#js_name','.wx_follow_nickname','#profileBt .profile_nickname','.rich_media_meta_nickname'),

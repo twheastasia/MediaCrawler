@@ -62,6 +62,55 @@ def test_sogou_signed_article_urls_without_biz_are_valid_public_articles():
     assert parse_article(snapshot(url=url))["type"] == "article"
 
 
+@pytest.mark.parametrize("separator", ["&", "&amp;"])
+def test_timestamp_and_signature_survive_dom_url_and_html_attribute(separator):
+    from urllib.parse import parse_qs, urlsplit
+    from lxml import html as lh
+    from media_platform.weixin.extractor import public_url
+    url = separator.join(["https://mp.weixin.qq.com/s?src=11", "timestamp=1792055016",
+                          "ver=7027", "signature=a%2Bb%2Fc%3D", "new=1"])
+    expected = {"src": ["11"], "timestamp": ["1792055016"], "ver": ["7027"],
+                "signature": ["a+b/c="], "new": ["1"]}
+    canonical = article_url(url)
+    assert parse_qs(urlsplit(canonical).query) == expected
+    assert article_url(canonical) == canonical
+    assert parse_qs(urlsplit(public_url(url)).query) == expected
+    item = parse_article(snapshot(url=url, content_html=f'<p>正文<a href="{url}">来源</a></p>'))
+    assert parse_qs(urlsplit(item["url"]).query) == expected
+    href = lh.fromstring(item["raw"]["article_html"]).xpath(".//a/@href")[0]
+    assert parse_qs(urlsplit(href).query) == expected
+
+
+def test_dom_query_parameter_names_are_not_html_entities():
+    from media_platform.weixin.extractor import public_url, discovery_navigation_url
+    from urllib.parse import parse_qs, urlsplit
+    url = "https://example.org/?src=11&timestamp=1792055016&copy_field=1&notable=2"
+    assert parse_qs(urlsplit(public_url(url)).query) == {
+        "src": ["11"], "timestamp": ["1792055016"], "copy_field": ["1"], "notable": ["2"]}
+    bridge = discovery_navigation_url("https://weixin.sogou.com/link?url=public&amp;token=routing")
+    assert parse_qs(urlsplit(bridge).query) == {"url": ["public"], "token": ["routing"]}
+
+
+@pytest.mark.parametrize("marker", ["%C3%97tamp%3D", "%c3%97tamp%3d", "×tamp="])
+def test_historical_url_repair_preserves_signed_query_bytes(marker):
+    from store.weixin.repair_urls import repaired_url
+    bad = f"https://mp.weixin.qq.com/s?new=1&signature=a%2Bb%2Fc%3D&src=11{marker}1792055016&ver=7027"
+    fixed = repaired_url(bad)
+    assert fixed == bad.replace(marker, "&timestamp=")
+    assert repaired_url(fixed) == fixed
+
+
+@pytest.mark.parametrize("url", [
+    "https://example.org/s?src=11%C3%97tamp%3D1792055016",
+    "https://mp.weixin.qq.com/s?src=11%C3%97tamp%3Dinvalid&signature=x",
+    "https://mp.weixin.qq.com/s?src=11%C3%97tamp%3D1792055016&timestamp=1792055016&signature=x",
+])
+def test_historical_url_repair_rejects_ambiguous_or_unexpected_input(url):
+    from store.weixin.repair_urls import repaired_url
+    with pytest.raises(ValueError):
+        repaired_url(url)
+
+
 @pytest.mark.parametrize("url", ["https://evil.example/s/a", "https://mp.weixin.qq.com.evil.example/s/a", "https://mp.weixin.qq.com:8443/s/a", "file:///tmp/a", "https://mp.weixin.qq.com/s?mid=1"])
 def test_url_input_only_accepts_valid_wechat_articles(url):
     with pytest.raises(ValueError):
@@ -453,3 +502,290 @@ async def test_migration_verification_failure_keeps_all_legacy_data(tmp_path):
         assert await c.fetchval("SELECT body FROM wxarticle_content") == "conflicting_target"
         assert await c.fetchval("SELECT to_regclass('acquisition_weixin_task')")
         assert await c.fetchval("SELECT count(*) FROM acquisition_media WHERE platform='weixin'") == 1
+
+
+def test_account_migration_is_skipped_without_following_any_link():
+    from media_platform.weixin.extractor import check_article_page, ArticleSkipped
+    value = snapshot(page_text='该公众号已迁移，访问文章',
+                     migration_url='https://mp.weixin.qq.com/s/new')
+    with pytest.raises(ArticleSkipped, match='account_migrated'):
+        check_article_page(value)
+    with pytest.raises(ArticleSkipped):
+        parse_article(value)
+    with pytest.raises(AccessRestricted):
+        check_article_page({**value, 'verify': True})
+    assert check_article_page(snapshot()) is None
+
+
+@pytest.mark.asyncio
+async def test_migration_page_never_requests_access_article_destination(tmp_path):
+    from media_platform.weixin.extractor import ARTICLE_SNAPSHOT
+    from types import SimpleNamespace
+    job = WeixinJob(Namespace(output=tmp_path, run_id='weixin_test'), {})
+    urls, gates = [], []
+    class Page:
+        async def goto(self, url, **kw):
+            urls.append(url)
+            return SimpleNamespace(status=200)
+        async def wait_for_timeout(self, *a): pass
+        async def wait_for_function(self, *a, **kw): pass
+    class Browser:
+        page = Page()
+        async def evaluate(self, expression):
+            if len(urls) == 1:
+                return snapshot(page_text='该公众号已迁移', migration_url='https://mp.weixin.qq.com/s/new', content_html='')
+            return snapshot(url=urls[-1])
+    class Gate:
+        async def action(self, label, operation):
+            gates.append(label)
+            return await operation()
+    job.page, job.gate = Browser(), Gate()
+    from media_platform.weixin.extractor import ArticleSkipped
+    with pytest.raises(ArticleSkipped):
+        await job.document('https://mp.weixin.qq.com/s/old', ARTICLE_SNAPSHOT)
+    assert urls == ['https://mp.weixin.qq.com/s/old']
+    assert len(gates) == 1
+
+
+def test_sogou_routing_token_is_transient_and_absent_from_persisted_evidence():
+    from media_platform.weixin.extractor import discovery_navigation_url, candidate_url
+    raw = '/link?url=public-opaque&type=2&query=AI&token=PRIVATE-ROUTING'
+    assert 'token=PRIVATE-ROUTING' in discovery_navigation_url(raw)
+    assert 'token' not in candidate_url(raw)
+    rows = parse_search({'cards': [{'title': '文章', 'url': raw,
+        'html': '<h3><a href="'+raw+'">文章</a></h3>'}]})
+    assert 'PRIVATE-ROUTING' not in json.dumps(rows)
+    with pytest.raises(ValueError):
+        discovery_navigation_url('https://evil.example/link?token=PRIVATE-ROUTING')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verification", [False, True, "migrated"])
+async def test_sogou_native_click_keeps_search_and_never_persists_routing_tokens(tmp_path, verification):
+    from media_platform.weixin.extractor import SEARCH_SNAPSHOT
+    from types import SimpleNamespace
+    job = WeixinJob(Namespace(output=tmp_path, run_id='weixin_test'), {'media': False})
+    stored, events = [], []
+    raw = '/link?url=public&type=2&token=PRIVATE-ROUTING'
+    class Store:
+        async def enqueue(self, *a): pass
+        async def task(self, *a): return {'status': 'succeeded'}
+        async def search_results(self, *a): stored.append(a[-1])
+        async def known_article(self, *a): return None
+        async def state(self, *a): pass
+        async def persist_article(self, key, item, aliases, media): stored.append(aliases)
+    async def document(url, script, referer=None):
+        assert script == SEARCH_SNAPSHOT
+        return {'url': 'https://weixin.sogou.com/weixin?query=AI', 'cards': [
+            {'title': '文章', 'url': raw}]}
+    class Popup:
+        async def wait_for_load_state(self, *a, **kw): pass
+        async def wait_for_timeout(self, *a): pass
+        async def wait_for_function(self, *a, **kw): pass
+        async def close(self): events.append('popup_closed')
+    popup = Popup()
+    class Anchor:
+        async def get_attribute(self, name): return raw
+        async def evaluate(self, code): events.append('target_blank')
+        async def click(self, **kw): events.append('native_click')
+    class PendingPopup:
+        async def __aenter__(self):
+            async def value(): return popup
+            return SimpleNamespace(value=value())
+        async def __aexit__(self, *a): pass
+    class Search:
+        def locator(self, selector): return self
+        def nth(self, index): return Anchor()
+        def expect_popup(self, **kw): return PendingPopup()
+        async def close(self): events.append('search_closed')
+    search = Search()
+    class Session:
+        async def send(self, *a): return {'targetInfo': {'targetId': 'owned-popup'}}
+        async def detach(self): pass
+    class Context:
+        async def new_cdp_session(self, page): return Session()
+    async def evaluate(script):
+        return snapshot(verify=verification is True, page_text='该公众号已迁移' if verification == 'migrated' else '')
+    class Gate:
+        async def action(self, label, operation):
+            events.append(label)
+            return await operation()
+    job.page = SimpleNamespace(page=search, context=Context(), evaluate=evaluate)
+    job.gate, job.store, job.document = Gate(), Store(), document
+    await job.search_page('AI', 1)
+    safe = stored[0][0]['url']
+    if verification is True:
+        with pytest.raises(AccessRestricted):
+            await job.article({'task_key': 'a', 'payload': {'url': safe}})
+        assert job.keep_verification_page and job.page.page is popup
+        assert 'search_closed' in events and 'popup_closed' not in events
+    else:
+        if verification == 'migrated':
+            from media_platform.weixin.extractor import ArticleSkipped
+            with pytest.raises(ArticleSkipped):
+                await job.article({'task_key': 'a', 'payload': {'url': safe}})
+            assert not job.keep_verification_page
+        else:
+            await job.article({'task_key': 'a', 'payload': {'url': safe}})
+        assert job.page.page is search and 'popup_closed' in events
+        assert 'search_closed' not in events
+    assert events.count('native_click') == 1
+    assert events.count('weixin_result_click') == 1
+    assert 'PRIVATE-ROUTING' not in json.dumps(stored)
+
+
+@pytest.mark.asyncio
+async def test_stale_sogou_bridge_refreshes_search_without_opening_old_link(tmp_path):
+    job = WeixinJob(Namespace(output=tmp_path, run_id='weixin_test'), {})
+    events = []
+    class Pool:
+        async def fetch(self, *a): return [{'source_key': 'search:AI', 'evidence': {'page': 2}}]
+    class Store:
+        pool = Pool()
+        async def known_article(self, *a): return None
+        async def finish(self, *args): events.append(args)
+    async def search(keyword, page):
+        assert (keyword, page) == ('AI', 2)
+        job.navigation_links['https://weixin.sogou.com/link?url=fresh'] = ('fresh', 'search')
+    async def forbidden(*a, **kw): pytest.fail('stale bridge must not be opened')
+    job.store, job.search_page, job.document = Store(), search, forbidden
+    await job.article({'task_key': 'old', 'payload': {'url': 'https://weixin.sogou.com/link?url=old'}})
+    assert events == [('old', 'deferred', 'discovery_link_refreshed')]
+
+
+@pytest.mark.asyncio
+async def test_media_quantum_preserves_backlog_for_next_article_page(tmp_path):
+    job = WeixinJob(Namespace(output=tmp_path, run_id='weixin_test'), {})
+    pending = [{'task_key': str(i)} for i in range(5)]
+    completed = []
+    class Store:
+        async def tasks(self, kind): return list(pending)
+    async def attempt(task, operation):
+        await operation()
+        pending.remove(task)
+        return True
+    async def download(task): completed.append(task['task_key'])
+    job.store, job.attempt, job.download = Store(), attempt, download
+    await job.media(limit=2)
+    assert completed == ['0', '1']
+    assert [t['task_key'] for t in pending] == ['2', '3', '4']
+    await job.media()
+    assert completed == ['0', '1', '2', '3', '4'] and not pending
+
+
+@pytest.mark.asyncio
+async def test_skipped_migration_does_not_block_next_article(tmp_path):
+    from media_platform.weixin.extractor import ArticleSkipped
+    job = WeixinJob(Namespace(output=tmp_path, run_id='weixin_test'), {})
+    events = []
+    class Store:
+        async def start(self, key): events.append(('start', key))
+        async def finish(self, *args): events.append(args)
+    job.store = Store()
+    job.progress = lambda *a, **kw: None
+    async def migrated(): raise ArticleSkipped('account_migrated')
+    async def next_article(): events.append(('next_article_read',))
+    assert not await job.attempt({'task_key': 'moved', 'kind': 'article', 'attempts': 0}, migrated)
+    assert await job.attempt({'task_key': 'next', 'kind': 'article', 'attempts': 0}, next_article)
+    assert ('moved', 'skipped', 'account_migrated') in events
+    assert ('next_article_read',) in events and not job.keep_verification_page
+
+
+@pytest.mark.parametrize('text', ['此账号已被屏蔽, 内容无法查看', '此账号已被屏蔽，内容无法查看'])
+def test_blocked_account_is_a_skipped_article_not_a_verification(text):
+    from media_platform.weixin.extractor import ArticleSkipped
+    with pytest.raises(ArticleSkipped, match='account_blocked'):
+        parse_article(snapshot(page_text=text, content_html='', title=''))
+    with pytest.raises(AccessRestricted):
+        parse_article(snapshot(page_text=text+'，完成安全验证', verify=True))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure,expected', [
+    ('blocked', 'account_blocked'), ('parse', 'article_parse_error'),
+    ('network', 'article_network_error'), ('timeout', 'article_timeout'),
+    ('load', 'article_load_error'),
+])
+async def test_article_failures_are_skipped_once_and_next_article_runs(tmp_path, failure, expected):
+    import httpx
+    from playwright.async_api import Error as BrowserError, TimeoutError as BrowserTimeout
+    from media_platform.weixin.extractor import ArticleSkipped
+    job = WeixinJob(Namespace(output=tmp_path, run_id='weixin_test'), {})
+    events = []
+    class Store:
+        async def start(self, key): events.append(('start', key))
+        async def finish(self, *args): events.append(args)
+    job.store = Store()
+    job.progress = lambda *a, **kw: None
+    errors = {'blocked': ArticleSkipped('account_blocked'), 'parse': ParseError('PRIVATE'),
+              'network': httpx.ConnectError('PRIVATE'), 'timeout': BrowserTimeout('PRIVATE'),
+              'load': BrowserError('PRIVATE')}
+    async def bad(): raise errors[failure]
+    async def good(): events.append(('next_ok',))
+    assert not await job.attempt({'task_key':'bad','kind':'article','attempts':0}, bad)
+    assert await job.attempt({'task_key':'next','kind':'article','attempts':0}, good)
+    assert events.count(('start','bad')) == 1
+    assert ('bad','skipped',expected) in events and ('next_ok',) in events
+    assert 'PRIVATE' not in json.dumps(events)
+
+
+@pytest.mark.asyncio
+async def test_search_parse_and_database_failures_are_not_hidden_as_article_skips(tmp_path):
+    job = WeixinJob(Namespace(output=tmp_path, run_id='weixin_test'), {})
+    events = []
+    class Store:
+        async def start(self, key): pass
+        async def finish(self, *args): events.append(args)
+    job.store = Store()
+    job.progress = lambda *a, **kw: None
+    async def search_bad(): raise ParseError('search_structure_changed')
+    async def database_bad(): raise RuntimeError('database_write_failed')
+    with pytest.raises(ParseError):
+        await job.attempt({'task_key':'search','kind':'search','attempts':0}, search_bad)
+    with pytest.raises(RuntimeError):
+        await job.attempt({'task_key':'write','kind':'article','attempts':0}, database_bad)
+    assert ('search','blocked','parse_error') in events
+    assert ('write','failed','RuntimeError') in events
+    assert all(e[1] != 'skipped' for e in events)
+
+
+@pytest.mark.asyncio
+async def test_url_repair_preview_apply_repeat_and_preserved_identity():
+    from store.weixin.repair_urls import repair, repaired_url
+    bad = 'https://mp.weixin.qq.com/s?src=11%C3%97tamp%3D1792055016&signature=a%2Bb%3D&ver=7027'
+    async with database_store() as (store, c):
+        item = parse_article(snapshot())
+        item['url'] = bad
+        await store.content(item)
+        await c.execute('INSERT INTO wxarticle_alias VALUES($1,$2)', digest(bad), item['id'])
+        await store.link('原关键词', 'search', item)
+        before = dict(await c.fetchrow('SELECT * FROM wxarticle_content'))
+        aliases_before = await c.fetchval('SELECT count(*) FROM wxarticle_alias')
+        assert await repair(c) == {'dry_run': True, 'repaired': 1, 'remaining': 0}
+        assert dict(await c.fetchrow('SELECT * FROM wxarticle_content')) == before
+        assert await c.fetchval('SELECT count(*) FROM wxarticle_alias') == aliases_before
+        assert (await repair(c, dry_run=False))['repaired'] == 1
+        after = dict(await c.fetchrow('SELECT * FROM wxarticle_content'))
+        assert after['source_url'] == repaired_url(bad)
+        for field in ('content_id', 'raw', 'body', 'published_at', 'author_id'):
+            assert after[field] == before[field]
+        assert await store.known_article([bad]) == item['id']
+        assert await store.known_article([repaired_url(bad)]) == item['id']
+        assert await store.known_article([article_url(repaired_url(bad))]) == item['id']
+        assert (await store.links('原关键词'))[0]['content_id'] == item['id']
+        assert (await repair(c, dry_run=False))['repaired'] == 0
+
+
+@pytest.mark.asyncio
+async def test_url_repair_alias_collision_rolls_back_every_change():
+    from store.weixin.repair_urls import repair, repaired_url
+    bad = 'https://mp.weixin.qq.com/s?src=11%C3%97tamp%3D1792055016&signature=x'
+    async with database_store() as (store, c):
+        item = parse_article(snapshot())
+        item['url'] = bad
+        await store.content(item)
+        await c.execute('INSERT INTO wxarticle_alias VALUES($1,$2)', digest(repaired_url(bad)), 'other-id')
+        with pytest.raises(RuntimeError, match='url_alias_collision'):
+            await repair(c, dry_run=False)
+        assert (await c.fetchrow('SELECT source_url FROM wxarticle_content'))['source_url'] == bad
+        assert await c.fetchval('SELECT count(*) FROM wxarticle_alias') == 1

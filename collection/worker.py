@@ -30,9 +30,10 @@ from media_platform.bilibili import media as bili_media
 from media_platform.douyin import media as dy_media
 from media_platform.xhs import media as xhs_media
 from media_downloader import MediaDownloader, MediaItem, MediaType, is_ffmpeg_available
+from collection.text import html_text
 
 def text_of(value):
-    return ''.join(Selector(text=str(value or '')).xpath('//text()').getall())
+    return html_text(value)
 
 
 def stamp(value):
@@ -43,6 +44,9 @@ def stamp(value):
 
 
 def normalized(platform, raw, kind=None):
+    if platform in ('ks','wb','tieba'):
+        from collection.additional import normalize
+        return normalize(platform,raw)
     if platform == 'bili':
         v = raw.get('View') or raw
         owner = v.get('owner') or {}
@@ -75,6 +79,9 @@ def normalized(platform, raw, kind=None):
 
 
 def candidates(platform, data):
+    if platform in ('ks','wb','tieba'):
+        from collection.additional import extract_candidates
+        return extract_candidates(platform,data)
     result=[]
     if platform=='bili':
         result=[normalized(platform,x) for x in (data.get('result') or []) if x.get('bvid')]
@@ -111,8 +118,34 @@ class Job:
         self.headers={}
         self.downloader=None
         self.blocked_paths=set()
+        self.sms_attempted=False
+        self.historical_comment_phase=False
+        self.historical_comment_failures=0
+
+    async def sms_login(self,open_login=False):
+        if self.sms_attempted:return False
+        self.sms_attempted=True
+        from collection.sms_login import SmsLogin
+        helper=SmsLogin(self.page,self.platform,self.gate)
+        result=await helper.run(open_login=open_login)
+        if result:self.progress('sms_verified')
+        return result
+
+    async def refresh_session(self):
+        self.cookies.clear()
+        self.cookies.update(await self.page.credentials([DOMAINS[self.platform]]))
+        cookie='; '.join(f'{k}={v}' for k,v in self.cookies.items())
+        self.headers['Cookie']=cookie
+        if self.platform=='zhihu':
+            self.client.headers={k.lower():v for k,v in self.headers.items()}
+        else:self.client.headers=self.headers
+        self.client.cookie_dict=self.cookies
+        if hasattr(self.client,'_pc_tbs'):self.client._pc_tbs=''
+        self.blocked_paths.clear()
 
     def progress(self,status,**fields):
+        from collection.friendly_log import activity
+        activity(self.directory,self.platform,status,**fields)
         value=dict(platform=self.platform,pid=os.getpid(),browser='chrome_cdp',status=status,updated_at=time.time(),**fields)
         tmp=self.directory/'status.tmp';tmp.write_text(json.dumps(value,ensure_ascii=False,indent=2));tmp.replace(self.directory/'status.json')
         print(json.dumps(value,ensure_ascii=False),flush=True)
@@ -122,6 +155,22 @@ class Job:
         await response.aread()
         try:self.last_response=response.json()
         except ValueError:self.last_response=None
+        if (self.platform=='xhs' and self.historical_comment_phase and self.current_operation=='comments'
+            and response.status_code==461 and response.url.host=='edith.xiaohongshu.com'
+            and response.url.path in ('/api/sns/web/v2/comment/page','/api/sns/web/v2/comment/sub/page')):
+            # A visible verification page still pauses the platform. Only the
+            # user-authorized single-note historical comment failure is skipped.
+            wall=await self.page.evaluate('''() => {
+              const visible=e=>e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';
+              return [...document.querySelectorAll('iframe[src*=captcha],iframe[src*=challenge],.geetest_panel')].some(visible)||
+                /安全验证|完成验证后|访问受限|访问频次异常|请求太频繁/.test(document.body?.innerText||'');
+            }''')
+            payload=self.last_response.get('data') if isinstance(self.last_response,dict) else None
+            verification=(isinstance(payload,dict) and bool(payload.get('v_voucher')))
+            verification=verification or (isinstance(self.last_response,dict) and str(self.last_response.get('code')) in ('-352','-412','300011','300012'))
+            if not wall and not verification:
+                from collection.comments import HistoricalCommentUnavailable
+                raise HistoricalCommentUnavailable('xhs_historical_comment_http_461')
         if response.status_code in (401,403,406,412,429,461,471):
             self.blocked_paths.add((response.url.host,response.url.path))
             raise AccessRestricted(f'HTTP {response.status_code}')
@@ -138,6 +187,11 @@ class Job:
             raise RuntimeError('explicit in-memory session authorization is required')
         await self.page.connect(DOMAINS[self.platform])
         self.cookies=await self.page.credentials([DOMAINS[self.platform]])
+        from collection.sms_login import MARKERS
+        if not any(self.cookies.get(k) for k in MARKERS[self.platform]):
+            if not await self.sms_login(open_login=True):raise LoginRequired('login session missing; user login required')
+            self.cookies.clear()
+            self.cookies.update(await self.page.credentials([DOMAINS[self.platform]]))
         ua=await self.page.evaluate('() => navigator.userAgent')
         cookie='; '.join(f'{k}={v}' for k,v in self.cookies.items())
         self.headers={'User-Agent':ua,'Referer':DOMAINS[self.platform]+'/','Cookie':cookie}
@@ -222,6 +276,9 @@ class Job:
             raw=await self.client.get_note_by_id(item['id'],context.get('xsec_source','pc_search'),context.get('xsec_token',''))
             if not raw:raise ValueError('note detail missing')
             raw['note_id']=item['id']
+            # This is the public note routing value from the search result,
+            # not an authentication cookie. Keep it available for comments.
+            raw.setdefault('xsec_token',context.get('xsec_token',''))
             return normalized('xhs',raw)
         # Reuse MediaCrawler's HTML detail extraction, retaining raw author identity from search.
         raw=item['raw'];kind=item['type']
@@ -307,6 +364,7 @@ class Job:
                         if key in seen:continue
                         try:item=await self.detail(candidate)
                         except ValueError as e:
+                            if getattr(e,'requires_user_action',False):raise
                             await self.store.state('failed_detail:'+candidate['id'],{'error':str(e)});continue
                         await self.persist(item)
                         await self.store.link(kw,'search',item)
@@ -356,7 +414,10 @@ class Job:
             if state.get('done') and (state.get('target')==HISTORY_PER_AUTHOR or state.get('error_type')=='AccessRestricted'):continue
             self.progress('author_history',author=aid,target_notes=HISTORY_PER_AUTHOR)
             try:items=await self.history(aid)
+            except (AccessRestricted, LoginRequired):
+                raise
             except Exception as e:
+                if getattr(e,'requires_user_action',False):raise
                 # Never repeatedly call a restricted author endpoint; record the gap.
                 await self.store.state('author:'+aid,{'done':True,'status':'incomplete','error_type':type(e).__name__})
                 self.progress('author_history_gap',author=aid,error_type=type(e).__name__)
@@ -408,6 +469,8 @@ class Job:
             item=await self.store.cached(row['content_type'],row['content_id'])
             self.progress('downloading',content_id=item['id'])
             try:resources=await self.media_items(item)
+            except (AccessRestricted, LoginRequired):
+                raise
             except Exception as e:
                 await self.store.state(key,{'done':True,'status':'failed','error_type':type(e).__name__});continue
             downloaded=0
@@ -419,6 +482,9 @@ class Job:
                 if path:downloaded+=1
             await self.store.state(key,{'done':True,'status':'complete' if downloaded==len(resources) and resources else 'partial_or_unavailable',
                                        'downloaded':downloaded,'requested':len(resources)})
+            if item['raw'].get('_web_media_gaps'):
+                await self.store.state(key,{'done':True,'status':'partial_or_unavailable',
+                    'downloaded':downloaded,'requested':len(resources),'gaps':item['raw']['_web_media_gaps']})
 
     async def run(self):
         logging.disable(logging.CRITICAL)
@@ -429,11 +495,19 @@ class Job:
             self.lock_connection=await self.store.pool.acquire()
             locked=await self.lock_connection.fetchval('SELECT pg_try_advisory_lock(hashtext($1))','acquisition:'+self.platform)
             if not locked:raise RuntimeError('another worker already owns this platform')
-            await self.store.state('worker',{'pid':os.getpid(),'status':'running'})
-            await self.search_phase();await self.author_phase();await self.media_phase()
-            counts=await self.store.counts()
-            self.progress('finished',counts=counts)
-            await self.store.state('worker',{'pid':os.getpid(),'status':'finished','counts':counts})
+            from collection.sms import Settings as SmsSettings
+            await self.store.state('worker',{'pid':os.getpid(),'status':'running',
+                'sms_assistance_enabled':SmsSettings.load() is not None,
+                'native_comment_tables_enabled':True})
+            for attempt in range(2):
+                try:
+                    await self.collect_phases()
+                    break
+                except (AccessRestricted,LoginRequired):
+                    # An HTTP/business restriction alone never authorizes retry:
+                    # only an offered SMS form and confirmed SMS completion do.
+                    if attempt or not await self.sms_login():raise
+                    await self.refresh_session()
         except Exception as e:
             # Messages are deliberately restricted to error classes; credentials never appear in logs.
             self.progress('blocked',error_type=type(e).__name__,
@@ -452,12 +526,37 @@ class Job:
                     await self.store.pool.release(self.lock_connection)
                 await self.store.close()
 
+    async def collect_phases(self):
+        from collection.comments import phase as comments_phase
+        self.historical_comment_phase=True
+        try:await comments_phase(self)
+        finally:self.historical_comment_phase=False
+        await self.search_phase();await self.author_phase()
+        comment_counts=await comments_phase(self)
+        await self.media_phase()
+        counts=await self.store.counts()
+        self.progress('finished',counts=counts,comments=comment_counts)
+        await self.store.state('worker',{'pid':os.getpid(),'status':'finished','counts':counts,'comments':comment_counts})
+
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--platform',choices=PAGES,required=True)
     p.add_argument('--run-id',required=True)
     p.add_argument('--output',required=True);p.add_argument('--preflight',action='store_true')
+    p.add_argument('--smoke',action='store_true',help='Validate one real search, author history and attachment for new adapters')
     p.add_argument('--allow-session-memory',action='store_true')
-    asyncio.run(Job(p.parse_args()).run())
+    p.add_argument('--xhs-mode',choices=('api','web'),default='api')
+    args=p.parse_args()
+    if args.platform in ('maimai','linkedin'):
+        from collection.opencli_platforms import OpenCLIJob
+        job=OpenCLIJob(args)
+    elif args.platform in ('ks','wb','tieba'):
+        from collection.additional import AdditionalJob
+        job=AdditionalJob(args)
+    elif args.platform=='xhs' and args.xhs_mode=='web':
+        from collection.xhs_web import XhsWebJob
+        job=XhsWebJob(args)
+    else:job=Job(args)
+    asyncio.run(job.run())
 
 if __name__=='__main__':main()

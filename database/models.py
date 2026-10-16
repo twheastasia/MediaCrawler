@@ -21,12 +21,15 @@
 # 主页链接、签名、性别等一律不落库）。原始用户 ID 在提取层经
 # tools.user_hash.anonymize_user_id 转为匿名 creator_hash 后写入，
 # 仅用于"同一创作者"的内容分组；昵称保留但经 mask_nickname 中间脱敏。
+# 本任务按用户2026-10-16要求，在七张评论表另存公开评论用户 user_id；
+# 该字段不使用 creator_hash 代替。其他旧流程保持原有行为。
 # 创作者个人档案表（XhsCreator/DyCreator/WeiboCreator/TiebaCreator/
 # ZhihuCreator/BilibiliUpInfo/BilibiliContactInfo）已整体移除。
 
 from sqlalchemy import create_engine, Column, Integer, Text, String, BigInteger
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+import time
 
 Base = declarative_base()
 
@@ -57,6 +60,7 @@ class BilibiliVideo(Base):
 class BilibiliVideoComment(Base):
     __tablename__ = 'bilibili_video_comment'
     id = Column(Integer, primary_key=True, comment='主键ID')
+    user_id = Column(Text, comment='评论用户的公开平台ID')
     creator_hash = Column(String(64), index=True, comment='创作者匿名哈希')
     nickname = Column(Text, comment='用户昵称(已脱敏)')
     add_ts = Column(BigInteger, comment='添加时间戳')
@@ -110,6 +114,7 @@ class DouyinAweme(Base):
 class DouyinAwemeComment(Base):
     __tablename__ = 'douyin_aweme_comment'
     id = Column(Integer, primary_key=True, comment='主键ID')
+    user_id = Column(Text, comment='评论用户的公开平台ID')
     creator_hash = Column(String(64), index=True, comment='创作者匿名哈希')
     nickname = Column(Text, comment='用户昵称(已脱敏)')
     add_ts = Column(BigInteger, comment='添加时间戳')
@@ -145,6 +150,8 @@ class KuaishouVideo(Base):
 class KuaishouVideoComment(Base):
     __tablename__ = 'kuaishou_video_comment'
     id = Column(Integer, primary_key=True, comment='主键ID')
+    user_id = Column(Text, comment='评论用户的公开平台ID')
+    parent_comment_id = Column(String(255), comment='父评论ID')
     creator_hash = Column(String(64), index=True, comment='创作者匿名哈希')
     nickname = Column(Text, comment='用户昵称(已脱敏)')
     add_ts = Column(BigInteger, comment='添加时间戳')
@@ -175,6 +182,7 @@ class WeiboNote(Base):
 class WeiboNoteComment(Base):
     __tablename__ = 'weibo_note_comment'
     id = Column(Integer, primary_key=True, comment='主键ID')
+    user_id = Column(Text, comment='评论用户的公开平台ID')
     creator_hash = Column(String(64), index=True, comment='创作者匿名哈希')
     nickname = Column(Text, comment='用户昵称(已脱敏)')
     add_ts = Column(BigInteger, comment='添加时间戳')
@@ -215,6 +223,7 @@ class XhsNote(Base):
 class XhsNoteComment(Base):
     __tablename__ = 'xhs_note_comment'
     id = Column(Integer, primary_key=True, comment='主键ID')
+    user_id = Column(Text, comment='评论用户的公开平台ID')
     creator_hash = Column(String(64), index=True, comment='创作者匿名哈希')
     nickname = Column(Text, comment='用户昵称(已脱敏)')
     add_ts = Column(BigInteger, comment='添加时间戳')
@@ -243,13 +252,15 @@ class TiebaNote(Base):
     tieba_link = Column(Text, comment='贴吧链接')
     total_replay_num = Column(Integer, default=0, comment='总回复数')
     total_replay_page = Column(Integer, default=0, comment='总回复页数')
-    add_ts = Column(BigInteger, comment='添加时间戳')
+    add_ts = Column(BigInteger, nullable=False, default=lambda: int(time.time() * 1000),
+                    comment='首次采集时间戳（毫秒）')
     last_modify_ts = Column(BigInteger, comment='最后修改时间戳')
     source_keyword = Column(Text, default='', comment='来源关键词')
 
 class TiebaComment(Base):
     __tablename__ = 'tieba_comment'
     id = Column(Integer, primary_key=True, comment='主键ID')
+    user_id = Column(Text, comment='评论用户的公开平台ID')
     comment_id = Column(String(255), index=True, comment='评论ID')
     parent_comment_id = Column(String(255), default='', comment='父评论ID')
     content = Column(Text, comment='评论内容')
@@ -288,6 +299,7 @@ class ZhihuContent(Base):
 class ZhihuComment(Base):
     __tablename__ = 'zhihu_comment'
     id = Column(Integer, primary_key=True, comment='主键ID')
+    user_id = Column(Text, comment='评论用户的公开平台ID')
     comment_id = Column(String(64), index=True, comment='评论ID')
     parent_comment_id = Column(String(64), comment='父评论ID')
     content = Column(Text, comment='评论内容')
@@ -301,3 +313,27 @@ class ZhihuComment(Base):
     user_nickname = Column(Text, comment='平台公开昵称')
     add_ts = Column(BigInteger, comment='添加时间戳')
     last_modify_ts = Column(BigInteger, comment='最后修改时间戳')
+
+
+class MaimaiComment(Base):
+    __tablename__ = 'maimai_comment'
+    id = Column(Integer, primary_key=True)
+    content_id = Column(Text, index=True)
+    comment_id = Column(Text)
+    user_id = Column(Text, comment='公开评论用户ID；未暴露留空')
+    content = Column(Text)
+    parent_comment_id = Column(Text)
+    add_ts = Column(BigInteger)
+    last_modify_ts = Column(BigInteger)
+
+
+class LinkedInComment(Base):
+    __tablename__ = 'linkedin_comment'
+    id = Column(Integer, primary_key=True)
+    content_id = Column(Text, index=True)
+    comment_id = Column(Text)
+    user_id = Column(Text, comment='公开评论用户ID或公开主页路径；未暴露留空')
+    content = Column(Text)
+    parent_comment_id = Column(Text)
+    add_ts = Column(BigInteger)
+    last_modify_ts = Column(BigInteger)

@@ -7,3 +7,7 @@ class ParseError(RuntimeError):
 
 class ArticleUnavailable(RuntimeError):
     pass
+
+
+class ArticleSkipped(RuntimeError):
+    """A user-authorized page category that must not be followed."""

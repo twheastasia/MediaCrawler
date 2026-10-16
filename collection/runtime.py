@@ -13,7 +13,7 @@ import httpx
 
 class RequestGate:
     """One request at a time, including streaming transfers and retries."""
-    def __init__(self, log_path: Path, minimum: float = 30, jitter: float = 15):
+    def __init__(self, log_path: Path, minimum: float = 15, jitter: float = 0):
         self.lock = asyncio.Lock()
         self.minimum = minimum
         self.jitter = jitter

@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 import time
-from contextlib import suppress
+from contextlib import suppress, asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urljoin, urlsplit
@@ -23,18 +23,19 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from collection.chrome import ChromePage
-from collection.runtime import AccessRestricted, GatedTransport, RequestGate
+from collection.runtime import AccessRestricted, LoginRequired, GatedTransport, RequestGate
 from collection.settings import KEYWORDS
 from media_platform.weixin.extractor import (
-    ARTICLE_SNAPSHOT, SEARCH_SNAPSHOT, ArticleUnavailable, ParseError,
+    ARTICLE_SNAPSHOT, SEARCH_SNAPSHOT, ArticleUnavailable, ArticleSkipped, ParseError,
     access_check, article_url, candidate_url, digest, parse_article, parse_search,
-    public_url, search_url,
+    public_url, search_url, check_article_page, discovery_navigation_url,
 )
 from store.weixin import WeixinStore
 
 ROOT = Path(__file__).resolve().parents[2]
 GATE_LOG = ROOT / "data" / "weixin" / "requests.jsonl"
 BARRIERS = {401, 403, 406, 412, 429, 461, 471}
+MEDIA_PER_SEARCH_PAGE = 2
 
 
 class WorkerBusy(RuntimeError):
@@ -63,8 +64,25 @@ class WeixinJob:
         self.active_task = None
         self.keep_verification_page = False
         self.owned_target_id = None
+        # Routing tokens never enter task payloads, source evidence or logs.
+        self.navigation_links = {}
+        self.discovery_pages = set()
+        self.active_search_key = None
+        self.sms_attempted = False
+
+    async def sms_login(self):
+        if self.sms_attempted:
+            return False
+        self.sms_attempted = True
+        from collection.sms_login import SmsLogin
+        result = await SmsLogin(self.page,'weixin',self.gate).run()
+        if result:
+            self.progress('sms_verified')
+        return result
 
     def progress(self, status, **fields):
+        from collection.friendly_log import activity
+        activity(self.directory,'weixin',status,**fields)
         value = {"platform": "weixin", "run_id": self.args.run_id, "pid": os.getpid(),
                  "status": status, "updated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(), **fields}
         if self.owned_target_id:
@@ -72,9 +90,10 @@ class WeixinJob:
         save_json(self.directory / "status.json", value)
         print(json.dumps(value, ensure_ascii=False), flush=True)
 
-    async def document(self, url, script):
+    async def document(self, url, script, referer=None):
         async def visit():
-            response = await self.page.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            options = {"referer": referer} if referer else {}
+            response = await self.page.page.goto(url, wait_until="domcontentloaded", timeout=30000, **options)
             if response and response.status in BARRIERS:
                 raise AccessRestricted("http_" + str(response.status))
             if response and response.status in (404, 410):
@@ -92,22 +111,45 @@ class WeixinJob:
                         !!document.querySelector('#js_verify') ||
                         [...document.querySelectorAll('.weui-msg__title,.weui-msg__desc')].some(e=>e.textContent.trim())""", timeout=15000)
             return await self.page.evaluate(script)
-        return await self.gate.action("weixin_document", visit)
+        try:
+            snapshot = await self.gate.action("weixin_document", visit)
+            if script == ARTICLE_SNAPSHOT:
+                check_article_page(snapshot)
+        except AccessRestricted:
+            if not await self.sms_login():
+                raise
+            snapshot = await self.gate.action('weixin_after_sms',visit)
+            if script == ARTICLE_SNAPSHOT:
+                check_article_page(snapshot)
+        return snapshot
 
     async def search_page(self, keyword, page):
         key = "search:" + digest(keyword) + ":" + str(page).zfill(6)
         await self.store.enqueue(key, "search", {"keyword": keyword, "page": page})
         task = await self.store.task(key)
-        if task["status"] == "succeeded":
-            return True
-        if task["status"] != "pending":
-            return False
         async def operation():
             snapshot = await self.document(search_url(keyword, page), SEARCH_SNAPSHOT)
-            rows = parse_search(snapshot)
+            try:
+                rows = parse_search(snapshot)
+            except AccessRestricted:
+                if not await self.sms_login():
+                    raise
+                snapshot = await self.document(search_url(keyword,page),SEARCH_SNAPSHOT)
+                rows = parse_search(snapshot)
+            for index, card in enumerate(snapshot.get("cards", [])):
+                safe = candidate_url(card["url"])
+                self.navigation_links[safe] = (discovery_navigation_url(card["url"]), (keyword, page), index)
+            self.discovery_pages.add((keyword, page))
+            self.active_search_key = (keyword, page)
             await self.store.search_results(key, keyword, page, rows)
             if not rows:
                 await self.store.state("exhausted:" + digest(keyword), {"page": page, "reason": "empty_results"})
+        if task["status"] == "succeeded":
+            if (keyword, page) not in self.discovery_pages or self.active_search_key != (keyword, page):
+                await operation()
+            return True
+        if task["status"] != "pending":
+            return False
         return await self.attempt(task, operation)
 
     async def article(self, task):
@@ -119,7 +161,88 @@ class WeixinJob:
             if cached:
                 await self.store.persist_article(task["task_key"], cached, [url], self.settings["media"])
                 return
-        snapshot = await self.document(url, ARTICLE_SNAPSHOT)
+        if urlsplit(url).hostname == "weixin.sogou.com":
+            if url not in self.navigation_links or self.navigation_links[url][1] != self.active_search_key:
+                sources = await self.store.pool.fetch(
+                    "SELECT source_key,evidence FROM wxarticle_source WHERE run_id=$1 AND candidate_key=$2",
+                    self.args.run_id, task["task_key"])
+                for source in sources:
+                    if not source["source_key"].startswith("search:"):
+                        continue
+                    evidence = source["evidence"]
+                    if isinstance(evidence, str):
+                        evidence = json.loads(evidence)
+                    await self.search_page(source["source_key"][7:], int(evidence["page"]))
+            if url not in self.navigation_links:
+                # Preserve stale discovery evidence; collect fresh results instead.
+                await self.store.finish(task["task_key"], "deferred", "discovery_link_refreshed")
+                return
+            async with self.discovery_document(url) as snapshot:
+                await self.persist_snapshot(task, url, snapshot)
+            return
+        else:
+            snapshot = await self.document(url, ARTICLE_SNAPSHOT)
+        await self.persist_snapshot(task, url, snapshot)
+
+    @asynccontextmanager
+    async def discovery_document(self, url):
+        """Execute Sogou's own click handler; it adds k/h routing parameters."""
+        search_page = self.page.page
+        search_target = self.owned_target_id
+        popup = None
+        keep_popup = False
+        _, _, index = self.navigation_links[url]
+        anchor = search_page.locator('.news-list li h3 a').nth(index)
+        if candidate_url(await anchor.get_attribute('href')) != url:
+            raise ParseError('discovery_card_changed')
+        # Only our search tab is modified; popup is owned and closed after reading.
+        await anchor.evaluate('(a)=>a.setAttribute("target","_blank")')
+        try:
+            async def click():
+                nonlocal popup
+                async with search_page.expect_popup(timeout=15000) as event:
+                    await anchor.click(timeout=15000)
+                popup = await event.value
+                self.page.page = popup
+                session = await self.page.context.new_cdp_session(popup)
+                try:
+                    self.owned_target_id = (await session.send('Target.getTargetInfo'))['targetInfo']['targetId']
+                finally:
+                    await session.detach()
+                await popup.wait_for_load_state('domcontentloaded', timeout=30000)
+                await popup.wait_for_timeout(1500)
+                with suppress(Exception):
+                    await popup.wait_for_function("""() =>
+                        !!document.querySelector('#js_content')?.innerHTML?.trim() ||
+                        !!document.querySelector('#js_verify') ||
+                        [...document.querySelectorAll('.weui-msg__title,.weui-msg__desc')].some(e=>e.textContent.trim())""", timeout=15000)
+                return await self.page.evaluate(ARTICLE_SNAPSHOT)
+            snapshot = await self.gate.action('weixin_result_click', click)
+            try:
+                check_article_page(snapshot)
+            except AccessRestricted:
+                if not await self.sms_login():
+                    raise
+                snapshot = await self.page.evaluate(ARTICLE_SNAPSHOT)
+                check_article_page(snapshot)
+            yield snapshot
+        except (AccessRestricted,LoginRequired):
+            if popup:
+                keep_popup = True
+                self.keep_verification_page = True
+            raise
+        finally:
+            if keep_popup:
+                with suppress(Exception):
+                    await search_page.close()
+            else:
+                if popup:
+                    with suppress(Exception):
+                        await popup.close()
+                self.page.page = search_page
+                self.owned_target_id = search_target
+
+    async def persist_snapshot(self, task, url, snapshot):
         def url_shape(value):
             parsed = urlsplit(value or "")
             return {"host": parsed.hostname, "path": parsed.path, "query_keys": sorted({key for key, _ in parse_qsl(parsed.query)})}
@@ -133,6 +256,11 @@ class WeixinJob:
         await self.store.persist_article(task["task_key"], item, aliases, self.settings["media"])
 
     async def articles(self):
+        # Refreshing an old bridge can enqueue new candidates in the same page.
+        while await self.store.tasks("article"):
+            await self.article_batch()
+
+    async def article_batch(self):
         for task in await self.store.tasks("article"):
             if not task["payload"].get("seed"):
                 sources = await self.store.pool.fetch("SELECT source_key FROM wxarticle_source WHERE run_id=$1 AND candidate_key=$2", self.args.run_id, task["task_key"])
@@ -160,7 +288,16 @@ class WeixinJob:
             except AccessRestricted:
                 await self.store.finish(key, "blocked", "access_restricted")
                 raise
+            except ArticleSkipped as error:
+                reason = str(error) if str(error) in {"account_migrated", "account_blocked"} else "article_error"
+                await self.store.finish(key, "skipped", reason)
+                self.active_task = None
+                return False
             except ParseError:
+                if task.get("kind") == "article":
+                    await self.store.finish(key, "skipped", "article_parse_error")
+                    self.active_task = None
+                    return False
                 await self.store.finish(key, "blocked", "parse_error")
                 raise
             except ArticleUnavailable:
@@ -169,12 +306,24 @@ class WeixinJob:
                 return False
             except (httpx.HTTPError, TimeoutError, OSError) as error:
                 # Exception messages/URLs are deliberately not persisted.
+                if task.get("kind") == "article" and isinstance(error, httpx.HTTPError):
+                    await self.store.finish(key, "skipped", "article_network_error")
+                    self.active_task = None
+                    return False
                 if number == 2:
                     await self.store.finish(key, "failed", type(error).__name__)
                     self.active_task = None
                     return False
             except Exception as error:
-                from playwright.async_api import TimeoutError as BrowserTimeout
+                from playwright.async_api import TimeoutError as BrowserTimeout, Error as BrowserError
+                if task.get("kind") == "article" and isinstance(error, BrowserError):
+                    browser = getattr(self.page, "browser", None)
+                    if browser is not None and not browser.is_connected():
+                        await self.store.finish(key, "failed", "browser_disconnected")
+                        raise
+                    await self.store.finish(key, "skipped", "article_timeout" if isinstance(error, BrowserTimeout) else "article_load_error")
+                    self.active_task = None
+                    return False
                 if isinstance(error, BrowserTimeout):
                     if number < 2:
                         continue
@@ -236,8 +385,9 @@ class WeixinJob:
         finally:
             temporary.unlink(missing_ok=True)
 
-    async def media(self):
-        for task in await self.store.tasks("media"):
+    async def media(self, limit=None):
+        pending = await self.store.tasks("media")
+        for task in pending if limit is None else pending[:limit]:
             try:
                 success = await self.attempt(task, lambda task=task: self.download(task))
                 if not success:
@@ -258,7 +408,13 @@ class WeixinJob:
             self.initialized = True
             save_json(self.directory / "run.json", self.settings)
             GATE_LOG.parent.mkdir(parents=True, exist_ok=True)
-            self.gate = RequestGate(GATE_LOG)
+            self.gate = RequestGate(GATE_LOG, minimum=float(self.settings.get("request_interval_minimum", 10)), jitter=0)
+            await self.store.state("scheduling", {
+                "request_interval_minimum": self.gate.minimum, "request_jitter": 0,
+                "media_per_search_page": MEDIA_PER_SEARCH_PAGE,
+                "remaining_media": "drain_after_articles",
+                "sms_assistance": "configured_local_inbox_native_form_only",
+            })
             self.page = ChromePage(self.gate)
             self.progress("connecting")
             await self.page.connect("about:blank")
@@ -283,16 +439,21 @@ class WeixinJob:
                     if not await self.search_page(keyword, page):
                         await self.store.state("exhausted:" + digest(keyword), {"page": page, "reason": "search_failed"})
                     await self.articles()
-                    # Process each page's media before doing more discovery.
-                    await self.media()
+                    # Keep downloading without letting image-heavy articles starve discovery.
+                    await self.media(limit=MEDIA_PER_SEARCH_PAGE)
                 if not any_needed:
                     break
+            from media_platform.weixin.comments import phase as comments_phase
+            comment_summary = await comments_phase(self)
             await self.media()
             summary = await self.store.summary()
-            gaps = any(r["status"] in ("failed", "unavailable", "blocked", "pending", "running") for r in summary["tasks"])
+            summary['comments'] = comment_summary
+            gaps = any(r["status"] in ("failed", "unavailable", "skipped", "blocked", "pending", "running") for r in summary["tasks"])
             gaps = gaps or any(r["status"] not in ("downloaded", "disabled", "reference") for r in summary["media"])
             quotas = [{"keyword": kw, "target": self.settings["limit"], "collected": await self.store.successful(kw)} for kw in self.settings["keywords"]]
             gaps = gaps or any(q["collected"] < q["target"] for q in quotas)
+            gaps = gaps or any(r['status'] != 'public_visible_complete'
+                               for r in comment_summary['contents_by_status'])
             status = "completed_with_gaps" if gaps else "completed"
             await self.store.state("worker", {"status": status, "summary": summary, "quotas": quotas})
             self.progress(status, summary=summary, quotas=quotas)
@@ -303,8 +464,8 @@ class WeixinJob:
             return 2
         except Exception as error:
             if self.initialized:
-                self.keep_verification_page = isinstance(error, (AccessRestricted, ParseError))
-                requires_action = isinstance(error, (AccessRestricted, ParseError))
+                self.keep_verification_page = isinstance(error, (AccessRestricted, LoginRequired, ParseError))
+                requires_action = isinstance(error, (AccessRestricted, LoginRequired, ParseError))
                 code = "access_restricted" if isinstance(error, AccessRestricted) else ("parse_error" if isinstance(error, ParseError) else type(error).__name__)
                 self.progress("blocked" if requires_action else "failed", error_code=code, requires_user_action=requires_action)
                 with suppress(Exception):
@@ -382,7 +543,7 @@ def main():
             p.error("请指定 --url、--keyword 或 --keywords-default")
         settings = {"run_id": args.run_id, "platforms": ["weixin"], "content_types": ["articles"],
                     "urls": urls, "keywords": keywords, "limit": args.limit, "max_pages": args.max_pages,
-                    "media": not args.no_media, "browser": "chrome_cdp", "request_interval_minimum": 30}
+                    "media": not args.no_media, "browser": "chrome_cdp", "request_interval_minimum": 10}
     args.output.mkdir(parents=True, exist_ok=True)
     if args.background:
         command = [sys.executable, "-m", "media_platform.weixin"] + [value for value in sys.argv[1:] if value != "--background"]
